@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Nikolay Petukhov (NikPACodes)
 """
 Аппаратное управление PWM на Raspberry Pi 5 через RP1.
 

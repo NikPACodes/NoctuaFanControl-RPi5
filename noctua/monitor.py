@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Nikolay Petukhov (NikPACodes)
 """
 Отображение состояния и настроек Noctua Fan Control.
 

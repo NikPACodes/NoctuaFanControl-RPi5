@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Nikolay Petukhov (NikPACodes)
 """
 Работа с конфигурацией Noctua Fan Control.
 
