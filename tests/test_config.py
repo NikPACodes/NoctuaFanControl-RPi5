@@ -15,6 +15,7 @@
 """
 import copy
 import json
+import time
 
 import pytest
 
@@ -170,6 +171,7 @@ def test_06_hot_reload_retains_last_valid_settings(project, capsys):
     assert ctl.cfg['control']['nvme_levels'][4][1] == 191
     assert 'CONFIG_REJECTED' in ctl.config_error
 
+    time.sleep(0.5)
     changed = project.get()
     changed['control']['nvme_levels'][4][1] = 191
     changed['gpio']['pwm_gpio'] = 19

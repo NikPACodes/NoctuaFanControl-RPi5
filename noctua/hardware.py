@@ -131,11 +131,14 @@ class RP1HardwarePWM:
                     or current_duty != int(adopt_expected_duty_ns)
                 ):
                     raise RuntimeError(
-                        f"{self.channel} уже включён: period={current_period}, "
-                        f"duty={current_duty}, polarity={current_polarity}, "
-                        f"enable={enabled}. Передача возможна только с явным "
-                        "подтверждением измеренного состояния через "
-                        "NOCTUA_ADOPT_PWM_DUTY_NS."
+                        f"{self.channel} уже включён:\n"
+                        f"period={current_period},\n"
+                        f"duty={current_duty},\n"
+                        f"polarity={current_polarity},\n"
+                        f"enable={enabled}. "
+                        "Автоматический захват включённого PWM запрещён.\n"
+                        "Остановите предыдущий управляющий процесс и убедитесь, что канал принадлежит Noctua.\n"
+                        "Установите enable=0 для этого канала и повторно запустите daemon.\n"
                     )
 
                 # Принимаем канал без изменения period, duty и enable.
