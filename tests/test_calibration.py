@@ -14,11 +14,37 @@
 """
 import os
 import time
+import itertools
 
 import pytest
 from conftest import calibration
 
 pytestmark = pytest.mark.calibration
+
+
+def calibration_pwms(project):
+    """
+    PWM-точки для теста, только во временной конфигурации.
+    """
+    cfg = project.get()
+    minimum = int(cfg['health']['min_pwm_for_check'])
+
+    if minimum == 0:
+        cfg['health']['min_pwm_for_check'] = minimum = 1
+        project.put(cfg)
+
+    pwms = sorted({int(pwm) for key in ('cpu_levels', 'nvme_levels')
+                            for _, pwm in cfg['control'][key]
+                            if minimum <= int(pwm) < 255})
+
+    if not pwms:
+        cfg['health']['min_pwm_for_check'] = 77
+        cfg['control']['cpu_levels'] = [[30, 0], [40, 100]]
+        project.put(cfg)
+        pwms = [100]
+
+    return pwms
+
 
 def test_01_calibration_no_running_daemon_does_not_change_config(project):
     """
@@ -30,8 +56,9 @@ def test_01_calibration_no_running_daemon_does_not_change_config(project):
     Ожидаемый результат:
     - Калибровка завершается RuntimeError.
     - config.json не изменяется.
-    - Предыдущий baseline остаётся сохранённым.
+    - Исходное содержимое config.json, включая baseline_rpm, не изменяется.
     """
+    calibration_pwms(project)
     previous = project.config_path.read_bytes()
     with pytest.raises(RuntimeError, match='Daemon не отвечает'):
         calibration.calibrate()
@@ -52,8 +79,9 @@ def test_02_calibration_rejects_mismatched_pwm(project, monkeypatch):
     - Несовпадение PWM обнаруживается.
     - Новые значения RPM не записываются в baseline.
     - Предыдущий baseline сохраняется.
-    - Исходный режим AUTO восстанавливается.
+    - Восстанавливается исходный режим AUTO или MANUAL.
     """
+    calibration_pwms(project)
     cfg = project.get()
     cfg['health']['baseline_rpm'] = {'77': 1500}
     project.put(cfg)
@@ -67,7 +95,7 @@ def test_02_calibration_rejects_mismatched_pwm(project, monkeypatch):
     with pytest.raises(RuntimeError, match='другое значение'):
         calibration.calibrate()
     assert project.get()['health']['baseline_rpm'] == {'77': 1500}
-    assert project.get()['control']['mode'] == 'auto'
+    assert project.get()['control']['mode'] == cfg['control']['mode']
 
 
 def test_03_calibration_preserves_baseline_when_rpm_missing(project, monkeypatch):
@@ -83,12 +111,13 @@ def test_03_calibration_preserves_baseline_when_rpm_missing(project, monkeypatch
     - Калибровка обнаруживает недостаток валидных проб.
     - Новый baseline не сохраняется.
     - Предыдущие значения RPM остаются прежними.
-    - Режим AUTO восстанавливается.
+    - Восстанавливается исходный режим AUTO или MANUAL.
     """
+    calibration_pwms(project)
     cfg = project.get()
     cfg['health']['baseline_rpm'] = {'77': 1500}
     project.put(cfg)
-    count = iter(range(100))
+    count = itertools.count(1)
 
     def no_rpm():
         c = project.get()
@@ -102,12 +131,12 @@ def test_03_calibration_preserves_baseline_when_rpm_missing(project, monkeypatch
     with pytest.raises(RuntimeError, match='четырёх'):
         calibration.calibrate()
     assert project.get()['health']['baseline_rpm'] == {'77': 1500}
-    assert project.get()['control']['mode'] == 'auto'
+    assert project.get()['control']['mode'] == cfg['control']['mode']
 
 
-def test_04_calibration_success_saves_and_restores_auto(project, monkeypatch):
+def test_04_calibration_success_saves_and_restores_original_mode(project, monkeypatch):
     """
-    Успешная калибровка и восстановление AUTO.
+    Успешная калибровка и восстановление исходного режима.
     Проверка алгоритма калибровки, а не достоверности реальной зависимости PWM/RPM.
 
     Проверка:
@@ -118,10 +147,12 @@ def test_04_calibration_success_saves_and_restores_auto(project, monkeypatch):
     Ожидаемый результат:
     - Все измеренные уровни сохранены.
     - PWM=255 исключён из длительной калибровки.
-    - Режим AUTO восстановлен.
+    - Восстановлен первоначальный режим AUTO или MANUAL.
     - Предыдущее значение manual_pwm не потеряно.
     """
-    counter = iter(range(1, 100))
+    pwms = calibration_pwms(project)
+    original = project.get()
+    counter = itertools.count(1)
 
     def simulated_rpm():
         c = project.get()
@@ -135,9 +166,7 @@ def test_04_calibration_success_saves_and_restores_auto(project, monkeypatch):
     monkeypatch.setattr(calibration.time, 'sleep', lambda _: None)
     calibration.calibrate()
     result = project.get()
-    assert result['health']['baseline_rpm'] == {
-        '77': 1540, '115': 2300, '153': 3060, '191': 3820, '230': 4600,
-    }
+    assert result['health']['baseline_rpm'] == { str(pwm): pwm * 20 for pwm in pwms }
     assert '255' not in result['health']['baseline_rpm']
-    assert result['control']['mode'] == 'auto'
-    assert result['control']['manual_pwm'] == 128
+    assert result['control']['mode'] == original['control']['mode']
+    assert result['control']['manual_pwm'] == original['control']['manual_pwm']

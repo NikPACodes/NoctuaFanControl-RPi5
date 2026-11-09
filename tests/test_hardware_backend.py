@@ -254,6 +254,7 @@ def test_09_mux_requires_hardware_pwm(monkeypatch):
 def test_10_explicit_handoff_keeps_signal(tmp_path, monkeypatch):
     """
     Передача работающего PWM без пропадания сигнала.
+    Непрерывность физического PWM-сигнала данным тестом не подтверждается.
 
     Проверки:
     1) Принимаем канал с подтверждёнными period=40000 и duty=20000.

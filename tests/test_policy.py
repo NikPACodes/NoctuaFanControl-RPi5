@@ -16,7 +16,7 @@
 """
 
 import pytest
-from conftest import daemon
+from conftest import daemon, reference_pwm
 
 pytestmark = pytest.mark.policy
 
@@ -36,45 +36,72 @@ def test_01_interpolation_and_two_sensor_priority(project):
     """
     ctl = project.controller()
     curve = ctl.cfg['control']['nvme_levels']
-    assert daemon.interp_pwm(20, curve) == 0
-    assert daemon.interp_pwm(47.5, curve) == 134
-    assert daemon.interp_pwm(80, curve) == 255
-    assert ctl.choose_pwm(60, 40, 40)[:4] == (115, 115, 51, 'CPU')
+
+    for levels in (ctl.cfg['control']['cpu_levels'], curve):
+        temperatures = [(levels[0][0] - 1),
+                        (levels[-1][0] + 1)]
+        temperatures += [temp for temp, _ in levels]
+        temperatures += [((a[0] + b[0]) / 2) for a, b in zip(levels, levels[1:])]
+
+        for temp in temperatures:
+            assert daemon.interp_pwm(temp, levels) == reference_pwm(temp, levels)
+
+    # Локальный сценарий: CPU требует больше PWM.
+    ctl.cfg['control'].update(mode='auto',
+                              min_running_pwm=0,
+                              emergency_cpu_c=120,
+                              emergency_nvme_c=120,
+                              cpu_levels=[[20, 0], [60, 180]],
+                              nvme_levels=[[20, 0], [60, 80]])
+    assert ctl.choose_pwm(60, 20, 20)[:4] == (180, 180, 0, 'CPU')
 
     # Новый контроллер: предыдущие latch-значения не должны влиять на следующий независимый сценарий.
     ctl = project.controller()
-    assert ctl.choose_pwm(50, 55, 55)[:4] == (191, 51, 191, 'NVME')
+    ctl.cfg['control'].update(mode='auto',
+                              min_running_pwm=0,
+                              emergency_cpu_c=120,
+                              emergency_nvme_c=120,
+                              cpu_levels=[[20, 0], [60, 80]],
+                              nvme_levels=[[20, 0], [60, 180]])
+    assert ctl.choose_pwm(20, 60, 60)[:4] == (180, 0, 180, 'NVME')
 
 
 def test_02_hysteresis_three_degrees_and_dwell(project, monkeypatch):
     """
-    Гистерезис 3°C и выдержка 15 секунд.
-    Проверяется логику кода, а не реальная температура CPU или NVMe.
+    Гистерезис и выдержка из текущего config.json.
+    Проверяется логика кода, а не реальная температура CPU или NVMe.
 
     Проверки:
     1) Исходная температура управления 46°C.
-    2) Повышение до 48.9°C ещё не проходит гистерезис.
-    3) Повышение до 49°C достигает порога.
-    4) Понижение до 42°C сначала блокируется выдержкой.
-    5) После 15 секунд снижение разрешается.
+    2) Повышение меньше заданного гистерезиса не принимается.
+    3) Повышение на величину гистерезиса принимается.
+    4) Снижение блокируется до завершения minimum_dwell_s.
+    5) После завершения выдержки снижение разрешается.
 
     Ожидаемый результат:
     - Мелкие температурные скачки не меняют PWM.
-    - Повышение на 3°C принимается.
+    - Повышение на заданную величину гистерезиса принимается.
     - Снижение разрешено после выдержки.
     """
     ctl = project.controller()
+    hys = float(ctl.cfg['control']['hysteresis_c'])
+    dwell = float(ctl.cfg['control']['minimum_dwell_s'])
+    base = 46.0
     ctl.last_policy_change_time = 100
     monkeypatch.setattr(daemon.time, 'monotonic', lambda: 100.5)
-    assert ctl.hysteresis_temp(48.9, 46) == (46, False)
-    assert ctl.hysteresis_temp(49, 46) == (49, False)
+
+    if hys > 0:
+        assert ctl.hysteresis_temp(base + hys / 2, base) == (base, False)
+
+    assert ctl.hysteresis_temp(base + hys, base) == (base + hys, False)
 
     ctl.last_policy_change_time = 100
-    monkeypatch.setattr(daemon.time, 'monotonic', lambda: 110)
-    assert ctl.hysteresis_temp(42, 46) == (46, False)
+    if dwell > 0:
+        monkeypatch.setattr(daemon.time,'monotonic',lambda: 100 + dwell / 2)
+        assert ctl.hysteresis_temp(base - hys - 1, base) == (base, False)
 
-    monkeypatch.setattr(daemon.time, 'monotonic', lambda: 116)
-    assert ctl.hysteresis_temp(42, 46) == (42, True)
+    monkeypatch.setattr(daemon.time,'monotonic',lambda: 101 + dwell)
+    assert ctl.hysteresis_temp(base - hys - 1, base) == (base - hys - 1, True)
 
 
 def test_03_nvme_averaging_and_sensor_loss(project, monkeypatch):
@@ -82,25 +109,29 @@ def test_03_nvme_averaging_and_sensor_loss(project, monkeypatch):
     Усреднение NVMe и потеря датчика.
 
     Проверки:
-    1) Пять последовательных измерений NVMe: 49, 50, 52, 50, 49°C.
+    1)  Выполняем N+1 измерений NVMe, где N = nvme_average_samples.
+    Значения формируются повторением набора 49, 50, 52, 50, 49°C.
     2) Датчик перестаёт возвращать температуру.
 
     Ожидаемый результат:
-    - После пяти измерений средняя температура 50°C.
-    - История содержит пять выборок.
+    - Средняя температура соответствует среднему последних N измерений.
+    - История содержит N выборок.
     - При потере датчика история очищается.
     - Устаревшее среднее не используется как текущее.
-
-    Усреднение пяти выборок, не обязательно фиксированное временное окно в пять секунд.
     """
     ctl = project.controller()
-    samples = iter([49, 50, 52, 50, 49])
+    n = int(ctl.cfg['control']['nvme_average_samples'])
+    values = [[49, 50, 52, 50, 49][i % 5] for i in range(n + 1)]
+    samples = iter(values)
     monkeypatch.setattr(daemon, 'cpu_temp_c', lambda: 50)
     monkeypatch.setattr(daemon, 'nvme_current_temp_c', lambda: (next(samples), [50]))
-    for _ in range(5):
+    expected_average = sum(values[-n:]) / n
+
+    for _ in values:
         result = ctl.read_temperatures()
-    assert result[2] == 50.0
-    assert len(ctl.nvme_history) == 5
+    assert result[2] == pytest.approx(expected_average)
+    assert len(ctl.nvme_history) == n
+
     monkeypatch.setattr(daemon, 'nvme_current_temp_c', lambda: (None, []))
     assert ctl.read_temperatures()[2] is None
     assert len(ctl.nvme_history) == 0
@@ -112,27 +143,29 @@ def test_04_emergency_manual_and_missing_sensors(project):
 
     Проверки:
     1. Включаем MANUAL с PWM=0.
-    2. Повышаем CPU до аварийного порога 75°C.
-    3. Повышаем NVMe до аварийного порога 65°C.
+    2. Повышаем CPU до emergency_cpu_c из конфигурации.
+    3. Повышаем NVMe до emergency_nvme_c из конфигурации.
     4. Моделируем отсутствие обоих датчиков.
     5. Проверяем минимальный ненулевой PWM.
 
     Ожидаемый результат:
     - MANUAL PWM=0 принимается при обычных температурах.
     - Аварийный перегрев имеет приоритет над MANUAL.
-    - При потере датчиков применяется PWM=153.
-    - Ненулевой PWM ниже 51 поднимается до 51.
+    - При потере датчиков применяется sensor_failure_pwm из конфигурации.
+    - Ненулевой PWM ниже min_running_pwm повышается до заданного минимума.
     """
     ctl = project.controller()
-    ctl.cfg['control'].update(mode='manual', manual_pwm=0)
+    control = ctl.cfg['control']
+    control.update(mode='manual', manual_pwm=0)
+    below_emergency = -1.0
 
-    assert ctl.choose_pwm(40, 40, 40)[0] == 0
-    assert ctl.choose_pwm(75, 40, 40)[0] == 255
-    assert ctl.choose_pwm(40, 65, 40)[0] == 255
-    assert ctl.choose_pwm(None, None, None)[0] == 153
+    assert ctl.choose_pwm(below_emergency, below_emergency, below_emergency)[0] == 0
+    assert ctl.choose_pwm(control['emergency_cpu_c'], below_emergency, below_emergency)[0] == 255
+    assert ctl.choose_pwm(below_emergency, control['emergency_nvme_c'], below_emergency)[0] == 255
+    assert ctl.choose_pwm(None, None, None)[0] == ctl.cfg['failsafe']['sensor_failure_pwm']
 
-    ctl.cfg['control']['manual_pwm'] = 10
-    assert ctl.choose_pwm(40, 40, 40)[0] == 51
+    control['manual_pwm'] = 1
+    assert ctl.choose_pwm(below_emergency, below_emergency, below_emergency)[0] == max(1, control['min_running_pwm'])
 
 
 def test_05_rpm_formula_and_tach_failsafe(project, monkeypatch):
@@ -141,16 +174,16 @@ def test_05_rpm_formula_and_tach_failsafe(project, monkeypatch):
 
     Проверки:
     1) За одну секунду получено 187 импульсов.
-    2) В конфигурации используется 2 импульса/оборот.
+    2) Число импульсов на оборот берётся из tach_pulses_per_rev.
     3) Затем моделируется длительное отсутствие RPM.
 
     Формула:
     RPM = pulses * 60 / (time_seconds * pulses_per_rev)
 
     Ожидаемый результат:
-    - Расчёт RPM даёт 5610 об/мин.
-    - При отсутствии оборотов срабатывает TACH fail-safe.
-    - Итоговый PWM по текущей конфигурации равен 153.
+    - Расчёт RPM соответствует формуле с текущим pulses_per_rev.
+    - При моделируемом длительном отсутствии TACH срабатывает fail-safe.
+    - В тестовом сценарии target PWM повышается с 77 до 153.
     - Возвращается предупреждение TACH.
     """
     ctl = project.controller()
@@ -160,8 +193,16 @@ def test_05_rpm_formula_and_tach_failsafe(project, monkeypatch):
     monkeypatch.setattr(daemon.time, 'monotonic', lambda: 11)
     ctl.update_rpm()
 
-    # За 1 секунду, PPR=2: 187 * 60 / (1 * 2) = 5610 RPM.
-    assert ctl.rpm_ema == pytest.approx(5610)
+    # За 1 секунду: RPM = 187 * 60 / pulses_per_rev.
+    ppr = ctl.cfg['gpio']['tach_pulses_per_rev']
+
+    assert ctl.rpm_ema == pytest.approx(187 * 60 / ppr)
+
+    # Гарантированно проверяем включённую TACH fail-safe.
+    ctl.cfg['failsafe'].update(tach_fail_safe_enabled=True,
+                               tach_zero_min_pwm=77,
+                               tach_zero_seconds=5,
+                               tach_failure_pwm=153)
 
     ctl.zero_since = 100
     monkeypatch.setattr(daemon.time, 'monotonic', lambda: 110)
@@ -182,7 +223,7 @@ def test_06_start_boost_only_from_stopped_state(project, monkeypatch):
 
     Ожидаемый результат:
     - Переход 0→51 сначала устанавливает PWM=255.
-    - Продолжительность boost равна 0.7 секунды.
+    - Продолжительность boost соответствует kickstart_seconds из config.json.
     - Затем устанавливается PWM=51.
     - При переходе 51→77 boost не повторяется.
     """
@@ -192,11 +233,11 @@ def test_06_start_boost_only_from_stopped_state(project, monkeypatch):
     monkeypatch.setattr(daemon.time, 'sleep', delays.append)
     ctl.set_pwm(51)
     assert ctl.pwm.values[-2:] == [1.0, 51 / 255]
-    assert delays == [0.7]
+    assert delays == [ctl.cfg['control']['kickstart_seconds']]
 
     ctl.set_pwm(77)
     assert ctl.pwm.value == pytest.approx(77 / 255)
-    assert delays == [0.7]
+    assert delays == [ctl.cfg['control']['kickstart_seconds']]
 
 
 def test_07_rpm_baseline_warning_requires_30_seconds(project, monkeypatch):
@@ -218,6 +259,12 @@ def test_07_rpm_baseline_warning_requires_30_seconds(project, monkeypatch):
     Предупреждение означает необходимость проверки охлаждения.
     """
     ctl = project.controller()
+    ctl.cfg['health'].update(enabled=True,
+                             min_pwm_for_check=77,
+                             min_rpm_ratio=0.75,
+                             warn_after_seconds=30,
+                             baseline_rpm={})
+
     assert ctl.health()[0] == 'NO_BASELINE'
     ctl.applied_pwm = 115
     ctl.rpm_ema = 1000

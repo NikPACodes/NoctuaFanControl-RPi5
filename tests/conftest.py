@@ -1,5 +1,5 @@
 """
-Изоляция pytest: тесты не обращается к настоящим GPIO Raspberry Pi.
+Изоляция pytest: тесты не обращаются к настоящим GPIO Raspberry Pi.
 """
 from __future__ import annotations
 
@@ -116,14 +116,36 @@ def project(tmp_path, monkeypatch):
             instance.cpu_latched_temp = None
             instance.nvme_latched_temp = None
             instance.last_policy_change_time = time.monotonic()
-            instance.nvme_history = deque(maxlen=5)
+            instance.nvme_history = deque(maxlen=int(instance.cfg['control']['nvme_average_samples']))
             instance.zero_since = None
             instance.low_rpm_since = None
             instance.rpm_ema = 0.0
             instance.last_rpm_time = time.monotonic()
             instance.lock = threading.Lock()
             instance.pulses = 0
-            instance.pwm = FakePWM(18, initial_value=0, frequency=25000)
+            instance.pwm = FakePWM(int(instance.cfg['gpio']['pwm_gpio']),
+                                   initial_value=0,
+                                   frequency=int(instance.cfg['gpio']['pwm_frequency_hz']))
             return instance
 
     return Context()
+
+
+def reference_pwm(temperature, levels):
+    """
+    Независимая линейная интерполяция для ожидаемого PWM.
+
+    Использует текущие LEVEL из config.json, но НЕ вызывает daemon.interp_pwm().
+    """
+    if temperature <= levels[0][0]:
+        return levels[0][1]
+    if temperature >= levels[-1][0]:
+        return levels[-1][1]
+
+    for left, right in zip(levels, levels[1:]):
+        t0, pwm0 = left
+        t1, pwm1 = right
+        if t0 <= temperature <= t1:
+            return round(pwm0 + (temperature - t0) * (pwm1 - pwm0) / (t1 - t0))
+
+    raise AssertionError("Нет интервала для температуры")

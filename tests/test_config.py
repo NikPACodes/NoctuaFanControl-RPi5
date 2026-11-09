@@ -43,12 +43,12 @@ def test_01_validation_rejects_bad_curve_and_nan(project):
     assert config.validate_config(cfg) == cfg
 
     broken = copy.deepcopy(cfg)
-    broken['control']['nvme_levels'][4][1] = 20
+    broken['control']['nvme_levels'] = [[20, 120],[30, 90]]
     with pytest.raises(ValueError, match='PWM не должен уменьшаться'):
         config.validate_config(broken)
 
     broken = copy.deepcopy(cfg)
-    broken['control']['cpu_levels'][3][0] = float('nan')
+    broken['control']['cpu_levels'][0][0] = float('nan')
     with pytest.raises(ValueError, match='конечным'):
         config.validate_config(broken)
 
@@ -65,10 +65,15 @@ def test_02_invalid_level_keeps_original_config(project, monkeypatch):
     - Исходный config.json остаётся побайтно неизменным.
     """
     monkeypatch.setattr(config.time, 'sleep', lambda _: None)
+
+    cfg = project.get()
+    cfg['control']['nvme_levels'] = [[20, 120], [30, 140]]
+    project.put(cfg)
+
     before = project.config_path.read_bytes()
 
     with pytest.raises(ValueError, match='PWM не должен уменьшаться'):
-        config.set_level('nvme', 4, '55', '20')
+        config.set_level('nvme', 1, '30', '90')
 
     assert project.config_path.read_bytes() == before
 
@@ -121,7 +126,7 @@ def test_04_settings_lock_rejects_concurrent_writer(project):
 
 def test_05_second_daemon_cannot_claim_pwm(project):
     """
-    Только один daemon владеет PWM.
+    Файловая блокировка запрещает второй экземпляр daemon в одном каталоге проекта.
     Проверяется программная блокировка, не аппаратный GPIO.
 
     Проверки:
@@ -144,13 +149,13 @@ def test_05_second_daemon_cannot_claim_pwm(project):
 
 def test_06_hot_reload_retains_last_valid_settings(project, capsys):
     """
-    Ошибка hot-reload не останавливает управление.
+    Ошибка hot-reload не заменяет последнюю корректную конфигурацию.
 
     Проверки:
     1. Подготавливаем работающий контроллер.
     2. Записываем некорректную температурную кривую.
     3. Вызываем перезагрузку конфигурации.
-    4. Пытаемся изменить GPIO18 на GPIO19 без рестарта.
+    4. Пытаемся изменить pwm_gpio на другое допустимое значение без рестарта.
 
     Ожидаемый результат:
     - Некорректная конфигурация отклоняется.
@@ -159,23 +164,27 @@ def test_06_hot_reload_retains_last_valid_settings(project, capsys):
     - Изменение GPIO требует перезапуска daemon.
     """
     ctl = project.controller()
+    initial = copy.deepcopy(ctl.cfg)
+    gpio = initial['gpio']
     ctl.cfg_mtime = 0
     ctl.cfg_rejected_mtime = None
     ctl.config_error = None
-    ctl.hardware_signature = (18, 17, 25000)
+    ctl.hardware_signature = (gpio['pwm_gpio'],
+                              gpio['tach_gpio'],
+                              gpio['pwm_frequency_hz'])
 
     invalid = project.get()
-    invalid['control']['nvme_levels'][4][1] = 20
+    invalid['control']['nvme_levels'] = [[20, 120], [30, 90]]
     project.put(invalid)
     ctl.reload_config()
-    assert ctl.cfg['control']['nvme_levels'][4][1] == 191
+    assert ctl.cfg == initial
     assert 'CONFIG_REJECTED' in ctl.config_error
 
     time.sleep(0.5)
-    changed = project.get()
-    changed['control']['nvme_levels'][4][1] = 191
-    changed['gpio']['pwm_gpio'] = 19
+    changed = copy.deepcopy(initial)
+    changed['gpio']['pwm_gpio'] = next(pin for pin in range(28) if pin not in (gpio['pwm_gpio'],
+                                                                               gpio['tach_gpio']))
     project.put(changed)
     ctl.reload_config()
-    assert ctl.cfg['gpio']['pwm_gpio'] == 18
+    assert ctl.cfg == initial
     assert 'перезапуск' in ctl.config_error
