@@ -303,11 +303,13 @@ class Controller:
     Единственный владелец PWM и TACH Noctua.
     """
     def __init__(self) -> None:
+        # Configuration
         self.cfg = load_daemon_config()
         self.cfg_mtime = CONFIG.stat().st_mtime_ns
         self.cfg_rejected_mtime = None
         self.config_error = None
 
+        # GPIO configuration / Initial failsafe PWM
         gpio = self.cfg["gpio"]
         initial_pwm = int(self.cfg["failsafe"]["sensor_failure_pwm"])
 
@@ -315,6 +317,7 @@ class Controller:
                                    int(gpio["tach_gpio"]),
                                    int(gpio["pwm_frequency_hz"]))
 
+        # GPIO / PWM hardware initialization
         self.gpiochip = find_rp1_gpiochip()
         self.factory = LGPIOFactory(chip=self.gpiochip)
 
@@ -327,18 +330,36 @@ class Controller:
                                        bounce_time=None,
                                        pin_factory=self.factory)
 
+        # TACH pulse counter
         self.lock = threading.Lock()
         self.pulses = 0
         self.tach.when_activated = self._tach_pulse
         self.last_rpm_time = time.monotonic()
         self.rpm_ema = 0.0
+
+        # Raw TACH (RPM_TEST)
+        # Сырые окна TACH для воспроизводимых тестов RPM_TEST.
+        self.rpm_raw = None
+        self.tach_pulses = None
+        self.tach_window_seconds = None
+        self.tach_sample_seq = 0
+
+        # Fan State / Current PWM
         self.zero_since: float | None = None
         self.applied_pwm = int(round(self.pwm.value * 255))
+
+        # NVMe temperature averaging
         self.nvme_history: deque[float] = deque(maxlen=int(self.cfg["control"]["nvme_average_samples"]))
+
+        # Temperature control policy / Hysteresis
         self.cpu_latched_temp: float | None = None
         self.nvme_latched_temp: float | None = None
         self.last_policy_change_time = time.monotonic()
+
+        # Fan health monitoring
         self.low_rpm_since: float | None = None
+
+        # Daemon uptime
         self.started = time.time()
 
     # --------------------------------------------------------
@@ -369,6 +390,10 @@ class Controller:
 
         ppr = int(self.cfg["gpio"]["tach_pulses_per_rev"])
         rpm_raw = pulses * 60.0 / (dt * ppr)
+        self.rpm_raw = rpm_raw
+        self.tach_pulses = pulses
+        self.tach_window_seconds = dt
+        self.tach_sample_seq += 1
 
         if self.rpm_ema == 0.0 and rpm_raw > 0:
             self.rpm_ema = rpm_raw
@@ -700,10 +725,13 @@ class Controller:
         write_json_atomic(
             STATUS,
             {
+                # Daemon
                 "timestamp": time.time(),
                 "daemon_pid": os.getpid(),
                 "uptime_s": round(time.time() - self.started, 1),
                 "mode": self.cfg["control"]["mode"],
+
+                # GPIO / PWM interface
                 "gpiochip": self.gpiochip,
                 "pwm_gpio": int(self.cfg["gpio"]["pwm_gpio"]),
                 "tach_gpio": int(self.cfg["gpio"]["tach_gpio"]),
@@ -711,23 +739,39 @@ class Controller:
                 "pwm_backend": type(self.pwm).__name__,
                 "pwm_chip": self.pwm.chip.name,
                 "pwm_channel": int(self.pwm.channel.name.removeprefix("pwm")),
+
+                # PWM control
                 "target_pwm": target,
                 "applied_pwm": self.applied_pwm,
+
+                # TACH / RPM
                 "rpm": int(round(self.rpm_ema)),
+                "rpm_raw": None if self.rpm_raw is None else round(self.rpm_raw, 2),
+                "tach_pulses": self.tach_pulses,
+                "tach_window_seconds": None if self.tach_window_seconds is None else round(self.tach_window_seconds, 6),
+                "tach_sample_seq": self.tach_sample_seq,
+
+                # CPU / NVMe temperatures
                 "cpu_temp_c": None if cpu is None else round(cpu, 1),
                 "nvme_temp_current_c": None if nvme_current is None else round(nvme_current, 1),
                 "nvme_temp_avg_c": None if nvme_average is None else round(nvme_average, 1),
                 "nvme_average_samples_used": len(self.nvme_history),
                 "nvme_average_samples_target": int(self.cfg["control"]["nvme_average_samples"]),
                 "nvme_device_temps_c": [round(value, 1) for value in nvme_devices],
+
+                # Temperature control policy
                 "cpu_latched_temp_c": None if self.cpu_latched_temp is None else round(self.cpu_latched_temp, 1),
                 "nvme_latched_temp_c": None if self.nvme_latched_temp is None else round(self.nvme_latched_temp, 1),
                 "pwm_cpu_requested": pwm_cpu,
                 "pwm_nvme_requested": pwm_nvme,
                 "control_source": source,
+
+                # Fan health
                 "expected_rpm": None if expected_rpm is None else int(round(expected_rpm)),
                 "rpm_ratio": None if rpm_ratio is None else round(rpm_ratio, 3),
                 "maintenance": maintenance,
+
+                # Alarms / Errors
                 "alarms": alarms + ([self.config_error] if self.config_error else []),
                 "config_error": self.config_error,
             },

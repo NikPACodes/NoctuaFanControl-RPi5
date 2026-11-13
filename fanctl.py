@@ -26,7 +26,8 @@ fanctl не работает с GPIO напрямую и самостоятел�
 """
 import sys
 
-from noctua.calibration import calibrate
+from noctua.calibration import calibrate, sync_reference
+from noctua.history_cli import show_fans, register_new_fan, show_history, show_test, show_comparison,
 from noctua.config import set_mode, set_pwm, load_cfg, set_level
 from noctua.monitor import status, watch, settings, print_curve, cpu_fan_info
 
@@ -46,8 +47,9 @@ def menu():
         print("3 — AUTO")
         print("4 — MANUAL PWM")
         print("5 — Изменить LEVEL CPU/NVMe")
-        print("6 — Calibrate baseline")
+        print("6 — Calibrate FULL/PARTIAL")
         print("7 — CPU/HAT fan")
+        print("8 — История baseline")
         print("q — выход")
         choice = input("> ").strip().lower()
         if choice == "1":
@@ -77,9 +79,16 @@ def menu():
                 pwm = str(current[1])
             set_level(sensor, index, temp, pwm)
         elif choice == "6":
-            calibrate()
+            profile = input("Профиль [full/partial]: ").strip().upper()
+            if profile not in ("FULL", "PARTIAL"):
+                print("Нужно full или partial")
+                continue
+            calibrate(profile)
         elif choice == "7":
             cpu_fan_info()
+            input("\nEnter...")
+        elif choice == "8":
+            show_history()
             input("\nEnter...")
         elif choice in ("q", "quit", "exit"):
             return
@@ -123,7 +132,17 @@ MANUAL:
 
 Калибровка:
 
-  python3 fanctl.py calibrate
+  sudo python3 fanctl.py calibrate --full
+  sudo python3 fanctl.py calibrate --partial
+
+История:
+  
+  sudo python3 fanctl.py fans register "Noctua NF-A4x20 5V PWM"
+  python3 fanctl.py fans
+  python3 fanctl.py baseline history
+  python3 fanctl.py baseline show 3
+  python3 fanctl.py baseline compare
+  sudo python3 fanctl.py baseline sync
 
 
 Интерактивное меню:
@@ -153,8 +172,28 @@ def main():
         set_pwm(args[1])
     elif command == "level" and len(args) == 5:
         set_level(args[1], args[2], args[3], args[4])
-    elif command == "calibrate":
-        calibrate()
+    elif command == "calibrate" and len(args) == 2 and args[1] in ("--full", "--partial"):
+        calibrate(args[1].lstrip("-").upper())
+    elif command == "fans":
+        if len(args) == 1:
+            show_fans()
+        elif len(args) >= 3 and args[1] == "register":
+            register_new_fan(" ".join(args[2:]))
+        else:
+            usage()
+            return 2
+    elif command == "baseline" and len(args) >= 2:
+        if args[1:] == ["history"]:
+            show_history()
+        elif args[1:] == ["compare"]:
+            show_comparison()
+        elif args[1:] == ["sync"]:
+            sync_reference()
+        elif len(args) == 3 and args[1] == "show":
+            show_test(int(args[2]))
+        else:
+            usage()
+            return 2
     else:
         usage()
         return 2

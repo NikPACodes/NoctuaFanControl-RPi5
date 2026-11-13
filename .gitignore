@@ -1,2 +1,14 @@
 .idea/
 __pycache__/
+.pytest_cache/
+*.py[cod]
+.coverage
+.venv/
+status.json
+config.json.bak
+.config.lock
+.daemon.lock
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

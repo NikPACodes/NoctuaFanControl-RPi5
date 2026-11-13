@@ -13,3 +13,6 @@ STATUS = BASE / "status.json"
 
 # Системный config.txt Raspberry Pi
 BOOTCFG = Path("/boot/firmware/config.txt")
+
+# БД с историей испытаний Noctua Fan
+DB_PATH = BASE / "data" / "noctua-history.sqlite3"
